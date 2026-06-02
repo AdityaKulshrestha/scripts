@@ -108,19 +108,26 @@ EOF
 check_vllm_env() {
     log_info "Checking for vLLM environment..."
 
-    # Check current environment
-    if command -v vllm &>/dev/null; then
-        VLLM_VER=$(vllm --version 2>/dev/null || echo "unknown")
-        log_success "vLLM found in current environment: $VLLM_VER"
+    # First, check if vLLM is already available as a Python module (env already activated)
+    if python -c "import vllm; print(vllm.__version__)" &>/dev/null; then
+        VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+        log_success "vLLM Python module found in current environment: $VLLM_VER"
         return 0
     fi
 
-    # Check .venv
+    # Check if vllm CLI command is available
+    if command -v vllm &>/dev/null; then
+        VLLM_VER=$(vllm --version 2>/dev/null || echo "unknown")
+        log_success "vLLM CLI found in current environment: $VLLM_VER"
+        return 0
+    fi
+
+    # Check .venv if it exists
     if [[ -d ".venv" ]]; then
         log_info "Found .venv, activating..."
         source .venv/bin/activate
-        if command -v vllm &>/dev/null; then
-            VLLM_VER=$(vllm --version 2>/dev/null || echo "unknown")
+        if python -c "import vllm; print(vllm.__version__)" &>/dev/null; then
+            VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
             log_success "vLLM found in .venv: $VLLM_VER"
             return 0
         fi
