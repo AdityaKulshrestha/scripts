@@ -261,7 +261,7 @@ run_single_benchmark() {
     if $PROFILE; then
         local profile_subdir="${PROFILE_DIR}/in${input_len}_out${output_len}_bs${batch_size}"
         mkdir -p "$profile_subdir"
-        cmd+=" --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$profile_subdir\"}'"
+        cmd+=" --profile --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$profile_subdir\"}'"
     fi
 
     echo "$cmd"
