@@ -20,7 +20,8 @@ NC='\033[0m' # No Color
 DEVICE=""
 METHOD=""
 PKG_MANAGER=""
-VENV_NAME=".venv"
+VENV_NAME=""
+VLLM_VERSION=""
 
 # =============================================================================
 # Help Documentation
@@ -43,7 +44,12 @@ OPTIONS:
     -d, --device <device>       Target device: cpu, cuda, xpu
     -m, --method <method>       Installation method: precompiled, build
     -p, --pkg-manager <manager> Package manager: uv, conda
-    -n, --name <name>           Virtual environment name (default: .venv)
+    -n, --name <name>           Virtual environment name
+    -v, --version <version>     vLLM version (e.g., 0.23.0).
+                                  - CPU: if not provided, uses the VLLM_CPU
+                                    environment variable.
+                                  - XPU: used to checkout the matching branch
+                                    before building.
     -h, --help                  Show this help message
 
 SUPPORTED PACKAGE MANAGERS:
@@ -262,6 +268,25 @@ setup_venv() {
 }
 
 # =============================================================================
+# vLLM Source Checkout
+# =============================================================================
+# Clone the vLLM repository unless a source folder already exists.
+# If 'vllm_source' or 'vllm' is already present, reuse it and cd into it.
+clone_vllm() {
+    if [[ -d "vllm_source" ]]; then
+        log_info "vllm_source folder already exists, skipping clone."
+        cd vllm_source
+    elif [[ -d "vllm" ]]; then
+        log_info "vllm folder already exists, skipping clone."
+        cd vllm
+    else
+        log_info "Cloning vLLM repository..."
+        git clone https://github.com/vllm-project/vllm.git vllm_source
+        cd vllm_source
+    fi
+}
+
+# =============================================================================
 # CPU Installation
 # =============================================================================
 install_cpu_precompiled() {
@@ -269,14 +294,24 @@ install_cpu_precompiled() {
     
     setup_venv
     
-    log_info "Fetching latest vLLM version..."
-    VLLM_VERSION=$(curl -s https://api.github.com/repos/vllm-project/vllm/releases/latest | grep -o '"tag_name": "[^"]*' | sed 's/"tag_name": "v//')
-    
+    # Determine which vLLM version to install:
+    #   - If the user provided a version, use it.
+    #   - Otherwise, fall back to the VLLM_CPU environment variable.
     if [[ -z "$VLLM_VERSION" ]]; then
-        log_error "Failed to fetch vLLM version."
-        log_error "Please check your proxy settings."
-        exit 1
+        if [[ -n "$VLLM_CPU" ]]; then
+            VLLM_VERSION="$VLLM_CPU"
+            log_info "No version provided, using VLLM_CPU env var: ${VLLM_VERSION}"
+        else
+            log_error "No vLLM version provided and VLLM_CPU env var is not set."
+            log_error "Provide a version with -v/--version or export VLLM_CPU."
+            exit 1
+        fi
+    else
+        log_info "Using user-provided vLLM version: ${VLLM_VERSION}"
     fi
+    
+    # Normalize: strip a leading 'v' if present (e.g. v0.23.0 -> 0.23.0)
+    VLLM_VERSION="${VLLM_VERSION#v}"
     
     log_info "Installing vLLM v${VLLM_VERSION}..."
     
@@ -299,9 +334,7 @@ install_cpu_build() {
     
     setup_venv
     
-    log_info "Cloning vLLM repository..."
-    git clone https://github.com/vllm-project/vllm.git vllm_source
-    cd vllm_source
+    clone_vllm
     
     log_info "Installing build dependencies..."
     if [[ "$PKG_MANAGER" == "uv" ]]; then
@@ -340,9 +373,7 @@ install_cuda_build() {
     
     setup_venv
     
-    log_info "Cloning vLLM repository..."
-    git clone https://github.com/vllm-project/vllm.git vllm_source
-    cd vllm_source
+    clone_vllm
     
     log_info "Building vLLM..."
     if [[ "$PKG_MANAGER" == "uv" ]]; then
@@ -369,10 +400,16 @@ install_xpu_build() {
     
     setup_venv
     
-    log_info "Cloning vLLM repository..."
-    git clone https://github.com/vllm-project/vllm.git vllm_source
-    cd vllm_source
-    git checkout v0.21.0
+    clone_vllm
+    
+    if [[ -n "$VLLM_VERSION" ]]; then
+        # Normalize: strip a leading 'v' if present (e.g. v0.23.0 -> 0.23.0)
+        VLLM_VERSION="${VLLM_VERSION#v}"
+        log_info "Checking out vLLM branch v${VLLM_VERSION}..."
+        git checkout "v${VLLM_VERSION}"
+    else
+        log_warn "No vLLM version provided, using the default branch."
+    fi
     
     log_info "Installing dependencies..."
     if [[ "$PKG_MANAGER" == "uv" ]]; then
@@ -435,6 +472,22 @@ select_method() {
     fi
 }
 
+select_venv_name() {
+    if [[ -z "$VENV_NAME" ]]; then
+        echo ""
+        read -p "Enter virtual environment name [.vllm]: " input_name
+        VENV_NAME="${input_name:-.vllm}"
+    fi
+}
+
+select_version() {
+    if [[ -z "$VLLM_VERSION" ]]; then
+        echo ""
+        read -p "Enter vLLM version (leave empty to use default/VLLM_CPU env): " input_version
+        VLLM_VERSION="$input_version"
+    fi
+}
+
 # =============================================================================
 # Parse Arguments
 # =============================================================================
@@ -458,6 +511,10 @@ parse_args() {
                 ;;
             -n|--name)
                 VENV_NAME="$2"
+                shift 2
+                ;;
+            -v|--version)
+                VLLM_VERSION="$2"
                 shift 2
                 ;;
             *)
@@ -491,6 +548,8 @@ main() {
     # Interactive selection if not provided
     select_device
     select_method
+    select_venv_name
+    select_version
     
     echo ""
     log_info "Configuration:"
