@@ -17,6 +17,7 @@ NC='\033[0m'
 
 # Default values
 BASE_URL="http://localhost:8000"
+TASK="llm"           # llm | embed | reranker
 MODEL=""
 INPUT_TOKENS=""      # can be a comma-separated list, e.g. "1024,512,128"
 OUTPUT_TOKENS=""     # can be a comma-separated list, e.g. "1024,512"
@@ -24,6 +25,7 @@ CONCURRENCY=""       # can be a comma-separated list (batch size), e.g. "8,16"
 NUM_PROMPTS=""
 REQUEST_RATE="inf"
 DATASET="random"
+TOKENIZER=""
 RESULTS_DIR="./results"
 RESULT_FILENAME=""
 APPEND_RESULT=false
@@ -74,17 +76,24 @@ MODES:
                     --output-tokens and/or --concurrency to benchmark
                     every combination automatically.
 
+TASKS:
+    llm         Chat/completions benchmarking
+    embed       Embeddings benchmarking
+    reranker    Reranker benchmarking
+
 REQUIRED OPTIONS (command-line mode):
+    --task <llm|embed|reranker>      Benchmark task (default: llm)
     --model <name>                  Model name/path
     --input-tokens <num[,num...]>   Input token length(s), e.g. "1024,512,128"
-    --output-tokens <num[,num...]>  Output token length(s), e.g. "1024,512"
-    --concurrency <num[,num...]>    Max concurrent requests / batch size(s), e.g. "8,16"
+    --output-tokens <num[,num...]>  Output token length(s), required for llm only
+    --concurrency <num[,num...]>    Max concurrency (llm/embed) or random batch size (reranker)
     --num-prompts <num>             Total number of prompts (applied to every combo)
 
 OPTIONAL OPTIONS:
     --base-url <url>            Server URL (default: http://localhost:8000)
     --request-rate <rate>       Request rate (default: inf)
     --dataset <name>            Dataset: random, sharegpt, sonnet (default: random)
+    --tokenizer <name>          Tokenizer name/path (optional; reranker defaults to model)
     --results-dir <path>        Results directory (default: ./results)
     --result-filename <name>    Custom result filename prefix (without extension)
     --append-result             Append to existing per-run result file
@@ -121,6 +130,15 @@ EXAMPLES:
     ./run_benchmark.sh --model meta-llama/Llama-2-7b \
         --input-tokens 128 --output-tokens 128 \
         --concurrency 4 --num-prompts 16
+
+    # Embedding benchmark
+    ./run_benchmark.sh --task embed --model BAAI/bge-large-en-v1.5 \
+        --input-tokens 256 --concurrency 32 --num-prompts 128
+
+    # Reranker benchmark
+    ./run_benchmark.sh --task reranker --model BAAI/bge-reranker-v2-m3 \
+        --tokenizer BAAI/bge-reranker-v2-m3 \
+        --input-tokens 512 --concurrency 5 --num-prompts 10
 
     # Interactive mode
     ./run_benchmark.sh -i
@@ -224,16 +242,34 @@ run_interactive() {
     read -p "Model name (required): " MODEL
     [[ -z "$MODEL" ]] && { log_error "Model is required"; exit 1; }
 
+    # Task
+    echo "Task options: llm, embed, reranker"
+    read -p "Task [llm]: " input
+    TASK="${input:-llm}"
+
+    case "$TASK" in
+        llm|embed|reranker) ;;
+        *) log_error "Invalid task: $TASK (must be llm, embed, or reranker)"; exit 1 ;;
+    esac
+
     # Input tokens
     read -p "Input tokens, comma-separated for a sweep e.g. 1024,512,128 (required): " INPUT_TOKENS
     [[ -z "$INPUT_TOKENS" ]] && { log_error "Input tokens required"; exit 1; }
 
-    # Output tokens
-    read -p "Output tokens, comma-separated for a sweep e.g. 1024,512 (required): " OUTPUT_TOKENS
-    [[ -z "$OUTPUT_TOKENS" ]] && { log_error "Output tokens required"; exit 1; }
+    # Output tokens (LLM-only)
+    if [[ "$TASK" == "llm" ]]; then
+        read -p "Output tokens, comma-separated for a sweep e.g. 1024,512 (required for llm): " OUTPUT_TOKENS
+        [[ -z "$OUTPUT_TOKENS" ]] && { log_error "Output tokens required for llm"; exit 1; }
+    else
+        OUTPUT_TOKENS="0"
+    fi
 
-    # Concurrency
-    read -p "Concurrency / batch size(s), comma-separated e.g. 8,16 (required): " CONCURRENCY
+    # Concurrency / rerank random-batch-size
+    if [[ "$TASK" == "reranker" ]]; then
+        read -p "Reranker random batch size(s), comma-separated e.g. 5,10 (required): " CONCURRENCY
+    else
+        read -p "Concurrency / batch size(s), comma-separated e.g. 8,16 (required): " CONCURRENCY
+    fi
     [[ -z "$CONCURRENCY" ]] && { log_error "Concurrency required"; exit 1; }
 
     # Num prompts
@@ -245,9 +281,20 @@ run_interactive() {
     REQUEST_RATE="${input:-inf}"
 
     # Dataset
-    echo "Dataset options: random, sharegpt, sonnet"
-    read -p "Dataset [random]: " input
-    DATASET="${input:-random}"
+    if [[ "$TASK" == "llm" ]]; then
+        echo "Dataset options: random, sharegpt, sonnet"
+        read -p "Dataset [random]: " input
+        DATASET="${input:-random}"
+    elif [[ "$TASK" == "embed" ]]; then
+        DATASET="random"
+        log_info "Task=embed -> dataset fixed to random"
+    else
+        DATASET="random-rerank"
+        log_info "Task=reranker -> dataset fixed to random-rerank"
+
+        read -p "Tokenizer [${MODEL}]: " input
+        TOKENIZER="${input:-$MODEL}"
+    fi
 
     # Results directory
     read -p "Results directory [./results]: " input
@@ -290,6 +337,7 @@ parse_args() {
             -h|--help) show_help ;;
             -i|--interactive) INTERACTIVE=true; shift ;;
             --base-url) BASE_URL="$2"; shift 2 ;;
+            --task) TASK="$2"; shift 2 ;;
             --model) MODEL="$2"; shift 2 ;;
             --input-tokens) INPUT_TOKENS="$2"; shift 2 ;;
             --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
@@ -297,6 +345,7 @@ parse_args() {
             --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
             --request-rate) REQUEST_RATE="$2"; shift 2 ;;
             --dataset) DATASET="$2"; shift 2 ;;
+            --tokenizer) TOKENIZER="$2"; shift 2 ;;
             --results-dir) RESULTS_DIR="$2"; shift 2 ;;
             --result-filename) RESULT_FILENAME="$2"; shift 2 ;;
             --append-result) APPEND_RESULT=true; shift ;;
@@ -324,9 +373,19 @@ parse_args() {
 validate_args() {
     local missing=()
 
+    case "$TASK" in
+        llm|embed|reranker) ;;
+        *)
+            log_error "Invalid --task '$TASK'. Must be one of: llm, embed, reranker"
+            exit 1
+            ;;
+    esac
+
     [[ -z "$MODEL" ]] && missing+=("--model")
     [[ -z "$INPUT_TOKENS" ]] && missing+=("--input-tokens")
-    [[ -z "$OUTPUT_TOKENS" ]] && missing+=("--output-tokens")
+    if [[ "$TASK" == "llm" && -z "$OUTPUT_TOKENS" ]]; then
+        missing+=("--output-tokens")
+    fi
     [[ -z "$CONCURRENCY" ]] && missing+=("--concurrency")
     [[ -z "$NUM_PROMPTS" ]] && missing+=("--num-prompts")
 
@@ -336,6 +395,15 @@ validate_args() {
         echo ""
         echo "Use --help for usage or -i for interactive mode"
         exit 1
+    fi
+
+    if [[ "$TASK" == "embed" ]]; then
+        DATASET="random"
+        OUTPUT_TOKENS="0"
+    elif [[ "$TASK" == "reranker" ]]; then
+        DATASET="random-rerank"
+        OUTPUT_TOKENS="0"
+        [[ -z "$TOKENIZER" ]] && TOKENIZER="$MODEL"
     fi
 
     [[ -z "$SWEEP_CSV" ]] && SWEEP_CSV="${RESULTS_DIR}/sweep_results.csv"
@@ -348,34 +416,56 @@ validate_args() {
 # =============================================================================
 build_bench_cmd() {
     local cmd="vllm bench serve"
-    cmd+=" --backend openai-chat"
     cmd+=" --base-url $BASE_URL"
     cmd+=" --model $MODEL"
-    cmd+=" --endpoint /v1/chat/completions"
-    cmd+=" --ignore-eos"
     cmd+=" --metric-percentiles 90"
 
-    # Dataset
-    case "$DATASET" in
-        random)
+    case "$TASK" in
+        llm)
+            cmd+=" --backend openai-chat"
+            cmd+=" --endpoint /v1/chat/completions"
+            cmd+=" --ignore-eos"
+
+            case "$DATASET" in
+                random)
+                    cmd+=" --dataset-name random"
+                    cmd+=" --random-input-len $INPUT_TOKENS"
+                    cmd+=" --random-output-len $OUTPUT_TOKENS"
+                    ;;
+                sharegpt)
+                    cmd+=" --dataset-name sharegpt"
+                    ;;
+                sonnet)
+                    cmd+=" --dataset-name sonnet"
+                    cmd+=" --sonnet-input-len $INPUT_TOKENS"
+                    cmd+=" --sonnet-output-len $OUTPUT_TOKENS"
+                    cmd+=" --sonnet-prefix-len 100"
+                    ;;
+            esac
+
+            cmd+=" --request-rate $REQUEST_RATE"
+            cmd+=" --num-prompts $NUM_PROMPTS"
+            cmd+=" --max-concurrency $CONCURRENCY"
+            ;;
+        embed)
+            cmd+=" --backend openai-embeddings"
+            cmd+=" --endpoint /v1/embeddings"
             cmd+=" --dataset-name random"
             cmd+=" --random-input-len $INPUT_TOKENS"
-            cmd+=" --random-output-len $OUTPUT_TOKENS"
+            cmd+=" --request-rate $REQUEST_RATE"
+            cmd+=" --num-prompts $NUM_PROMPTS"
+            cmd+=" --max-concurrency $CONCURRENCY"
             ;;
-        sharegpt)
-            cmd+=" --dataset-name sharegpt"
-            ;;
-        sonnet)
-            cmd+=" --dataset-name sonnet"
-            cmd+=" --sonnet-input-len $INPUT_TOKENS"
-            cmd+=" --sonnet-output-len $OUTPUT_TOKENS"
-            cmd+=" --sonnet-prefix-len 100"
+        reranker)
+            cmd+=" --backend vllm-rerank"
+            cmd+=" --endpoint /v1/rerank"
+            cmd+=" --dataset-name random-rerank"
+            cmd+=" --tokenizer $TOKENIZER"
+            cmd+=" --random-input-len $INPUT_TOKENS"
+            cmd+=" --num-prompts $NUM_PROMPTS"
+            cmd+=" --random-batch-size $CONCURRENCY"
             ;;
     esac
-
-    cmd+=" --request-rate $REQUEST_RATE"
-    cmd+=" --num-prompts $NUM_PROMPTS"
-    cmd+=" --max-concurrency $CONCURRENCY"
 
     # Profiling
     if $PROFILE; then
@@ -437,6 +527,7 @@ save_results_json() {
 {
   "timestamp": "$(date -Iseconds)",
   "config": {
+        "task": "$TASK",
     "model": "$MODEL",
     "base_url": "$BASE_URL",
     "input_tokens": $INPUT_TOKENS,
@@ -499,7 +590,7 @@ EOF
 init_sweep_csv() {
     if [[ ! -f "$SWEEP_CSV" ]]; then
         mkdir -p "$(dirname "$SWEEP_CSV")"
-        echo "timestamp,status,model,dataset,input_tokens,output_tokens,concurrency,num_prompts,request_rate,mean_ttft_ms,median_ttft_ms,p90_ttft_ms,mean_tpot_ms,median_tpot_ms,p90_tpot_ms,mean_itl_ms,median_itl_ms,p90_itl_ms,req_throughput_per_s,output_tok_throughput_per_s,tok_per_s_per_user,result_file,log_file" > "$SWEEP_CSV"
+        echo "timestamp,status,task,model,dataset,input_tokens,output_tokens,concurrency,num_prompts,request_rate,mean_ttft_ms,median_ttft_ms,p90_ttft_ms,mean_tpot_ms,median_tpot_ms,p90_tpot_ms,mean_itl_ms,median_itl_ms,p90_itl_ms,req_throughput_per_s,output_tok_throughput_per_s,tok_per_s_per_user,result_file,log_file" > "$SWEEP_CSV"
     fi
 }
 
@@ -507,7 +598,7 @@ append_sweep_row() {
     local status="$1"
 
     local row
-    row="$(date -Iseconds),${status},${MODEL},${DATASET},${INPUT_TOKENS},${OUTPUT_TOKENS},${CONCURRENCY},${NUM_PROMPTS},${REQUEST_RATE},${ME_MEAN_TTFT:-},${ME_MEDIAN_TTFT:-},${ME_P90_TTFT:-},${ME_MEAN_TPOT:-},${ME_MEDIAN_TPOT:-},${ME_P90_TPOT:-},${ME_MEAN_ITL:-},${ME_MEDIAN_ITL:-},${ME_P90_ITL:-},${ME_REQ_THROUGHPUT:-},${ME_OUTPUT_THROUGHPUT:-},${ME_INTERACTIVITY:-},${RESULT_FILE:-},${LOG_FILE:-}"
+    row="$(date -Iseconds),${status},${TASK},${MODEL},${DATASET},${INPUT_TOKENS},${OUTPUT_TOKENS},${CONCURRENCY},${NUM_PROMPTS},${REQUEST_RATE},${ME_MEAN_TTFT:-},${ME_MEDIAN_TTFT:-},${ME_P90_TTFT:-},${ME_MEAN_TPOT:-},${ME_MEDIAN_TPOT:-},${ME_P90_TPOT:-},${ME_MEAN_ITL:-},${ME_MEDIAN_ITL:-},${ME_P90_ITL:-},${ME_REQ_THROUGHPUT:-},${ME_OUTPUT_THROUGHPUT:-},${ME_INTERACTIVITY:-},${RESULT_FILE:-},${LOG_FILE:-}"
 
     echo "$row" >> "$SWEEP_CSV"
 }
@@ -596,8 +687,8 @@ run_single_benchmark() {
     local model_short
     model_short=$(basename "$MODEL" | tr '/' '_')
 
-    local combo_tag="in${INPUT_TOKENS}_out${OUTPUT_TOKENS}_c${CONCURRENCY}"
-    local prefix="${RESULT_FILENAME:-benchmark_${model_short}}"
+    local combo_tag="task${TASK}_in${INPUT_TOKENS}_out${OUTPUT_TOKENS}_c${CONCURRENCY}"
+    local prefix="${RESULT_FILENAME:-benchmark_${TASK}_${model_short}}"
 
     RESULT_FILE="${RESULTS_DIR}/${prefix}_${combo_tag}_${timestamp}.json"
     LOG_FILE="${RESULTS_DIR}/${prefix}_${combo_tag}_${timestamp}.log"
@@ -612,10 +703,16 @@ run_single_benchmark() {
     echo -e "${CYAN}        Benchmark Configuration${NC}"
     echo -e "${CYAN}========================================${NC}"
     echo "  Server:       $BASE_URL"
+    echo "  Task:         $TASK"
     echo "  Model:        $MODEL"
     echo "  Input:        $INPUT_TOKENS tokens"
     echo "  Output:       $OUTPUT_TOKENS tokens"
-    echo "  Concurrency:  $CONCURRENCY"
+    if [[ "$TASK" == "reranker" ]]; then
+        echo "  Rerank Batch: $CONCURRENCY"
+        echo "  Tokenizer:    $TOKENIZER"
+    else
+        echo "  Concurrency:  $CONCURRENCY"
+    fi
     echo "  Prompts:      $NUM_PROMPTS"
     echo "  Request Rate: $REQUEST_RATE"
     echo "  Dataset:      $DATASET"
