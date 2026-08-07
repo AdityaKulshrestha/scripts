@@ -2,7 +2,7 @@
 
 # =============================================================================
 # vLLM Online Benchmark Script
-# Supports: Interactive & Command-line modes
+# Supports: Interactive & Command-line modes, and parameter sweeps
 # =============================================================================
 
 set -euo pipefail
@@ -18,9 +18,9 @@ NC='\033[0m'
 # Default values
 BASE_URL="http://localhost:8000"
 MODEL=""
-INPUT_TOKENS=""
-OUTPUT_TOKENS=""
-CONCURRENCY=""
+INPUT_TOKENS=""      # can be a comma-separated list, e.g. "1024,512,128"
+OUTPUT_TOKENS=""     # can be a comma-separated list, e.g. "1024,512"
+CONCURRENCY=""       # can be a comma-separated list (batch size), e.g. "8,16"
 NUM_PROMPTS=""
 REQUEST_RATE="inf"
 DATASET="random"
@@ -28,6 +28,9 @@ RESULTS_DIR="./results"
 RESULT_FILENAME=""
 APPEND_RESULT=false
 INTERACTIVE=false
+
+# Sweep summary CSV (appended to after every single benchmark run)
+SWEEP_CSV=""
 
 # Profiling defaults
 PROFILE=false
@@ -57,7 +60,7 @@ log_error()   { echo -e "${RED}[✗]${NC} $1"; }
 show_help() {
     cat << 'EOF'
 ================================================================================
-                    vLLM Online Benchmark Script
+                    vLLM Online Benchmark Tool
 ================================================================================
 
 USAGE:
@@ -67,21 +70,26 @@ USAGE:
 MODES:
     Command-line    Provide all options via arguments
     Interactive     Prompt for options (use --interactive or -i)
+    Sweep           Pass comma-separated lists to --input-tokens,
+                    --output-tokens and/or --concurrency to benchmark
+                    every combination automatically.
 
 REQUIRED OPTIONS (command-line mode):
-    --model <name>              Model name/path
-    --input-tokens <num>        Input token length
-    --output-tokens <num>       Output token length
-    --concurrency <num>         Max concurrent requests
-    --num-prompts <num>         Total number of prompts
+    --model <name>                  Model name/path
+    --input-tokens <num[,num...]>   Input token length(s), e.g. "1024,512,128"
+    --output-tokens <num[,num...]>  Output token length(s), e.g. "1024,512"
+    --concurrency <num[,num...]>    Max concurrent requests / batch size(s), e.g. "8,16"
+    --num-prompts <num>             Total number of prompts (applied to every combo)
 
 OPTIONAL OPTIONS:
     --base-url <url>            Server URL (default: http://localhost:8000)
     --request-rate <rate>       Request rate (default: inf)
     --dataset <name>            Dataset: random, sharegpt, sonnet (default: random)
     --results-dir <path>        Results directory (default: ./results)
-    --result-filename <name>    Custom result filename (without extension)
-    --append-result             Append to existing result file
+    --result-filename <name>    Custom result filename prefix (without extension)
+    --append-result             Append to existing per-run result file
+    --sweep-csv <path>          Sweep summary CSV path
+                                 (default: <results-dir>/sweep_results.csv)
     -i, --interactive           Interactive mode
     -h, --help                  Show this help
 
@@ -94,13 +102,22 @@ PROFILING OPTIONS:
     --profile-flops             Record FLOPs
 
 VISUALIZATION:
-    --plot-timeline             Generate timeline plot after benchmark
+    --plot-timeline             Generate a timeline plot after each benchmark run
 
 PASS-THROUGH:
     --bench-args <args...>      Additional args for vllm bench serve (must be last)
 
+SWEEP BEHAVIOR:
+    When any of --input-tokens / --output-tokens / --concurrency contains more
+    than one comma-separated value, the script runs every combination
+    (cartesian product) back to back. After each individual run finishes
+    (success OR failure), a row is immediately appended to the sweep summary
+    CSV so results are never lost if a later run crashes or is interrupted.
+    Each run also still writes its own per-run JSON + log file, named with
+    its input/output/concurrency values so they never collide.
+
 EXAMPLES:
-    # Command-line mode
+    # Single command-line run
     ./run_benchmark.sh --model meta-llama/Llama-2-7b \
         --input-tokens 128 --output-tokens 128 \
         --concurrency 4 --num-prompts 16
@@ -119,6 +136,15 @@ EXAMPLES:
         --input-tokens 128 --output-tokens 128 \
         --concurrency 4 --num-prompts 16 \
         --plot-timeline
+
+    # Full parameter sweep: 3 input lens x 2 output lens x 2 batch sizes = 12 runs,
+    # results appended to results/sweep_results.csv as each run completes
+    ./run_benchmark.sh --model meta-llama/Llama-2-7b \
+        --input-tokens 1024,512,128 \
+        --output-tokens 1024,512 \
+        --concurrency 8,16 \
+        --num-prompts 64 \
+        --results-dir ./results
 
 ================================================================================
 EOF
@@ -164,7 +190,7 @@ check_vllm_env() {
 # =============================================================================
 check_server() {
     log_info "Checking server at $BASE_URL..."
-    
+
     local status
     status=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo "000")
 
@@ -199,19 +225,19 @@ run_interactive() {
     [[ -z "$MODEL" ]] && { log_error "Model is required"; exit 1; }
 
     # Input tokens
-    read -p "Input tokens (required): " INPUT_TOKENS
+    read -p "Input tokens, comma-separated for a sweep e.g. 1024,512,128 (required): " INPUT_TOKENS
     [[ -z "$INPUT_TOKENS" ]] && { log_error "Input tokens required"; exit 1; }
 
     # Output tokens
-    read -p "Output tokens (required): " OUTPUT_TOKENS
+    read -p "Output tokens, comma-separated for a sweep e.g. 1024,512 (required): " OUTPUT_TOKENS
     [[ -z "$OUTPUT_TOKENS" ]] && { log_error "Output tokens required"; exit 1; }
 
     # Concurrency
-    read -p "Concurrency (required): " CONCURRENCY
+    read -p "Concurrency / batch size(s), comma-separated e.g. 8,16 (required): " CONCURRENCY
     [[ -z "$CONCURRENCY" ]] && { log_error "Concurrency required"; exit 1; }
 
     # Num prompts
-    read -p "Number of prompts (required): " NUM_PROMPTS
+    read -p "Number of prompts per run (required): " NUM_PROMPTS
     [[ -z "$NUM_PROMPTS" ]] && { log_error "Num prompts required"; exit 1; }
 
     # Request rate
@@ -227,25 +253,29 @@ run_interactive() {
     read -p "Results directory [./results]: " input
     RESULTS_DIR="${input:-./results}"
 
+    # Sweep CSV
+    read -p "Sweep summary CSV [${RESULTS_DIR}/sweep_results.csv]: " input
+    SWEEP_CSV="${input:-${RESULTS_DIR}/sweep_results.csv}"
+
     # Profiling
     read -p "Enable profiling? (y/n) [n]: " input
     if [[ "${input,,}" == "y" ]]; then
         PROFILE=true
         read -p "Profile directory [./vllm_profile]: " input
         PROFILE_DIR="${input:-./vllm_profile}"
-        
+
         read -p "Record tensor shapes? (y/n) [n]: " input
         [[ "${input,,}" == "y" ]] && PROFILE_SHAPES=true
-        
+
         read -p "Record memory? (y/n) [n]: " input
         [[ "${input,,}" == "y" ]] && PROFILE_MEMORY=true
-        
+
         read -p "Record FLOPs? (y/n) [n]: " input
         [[ "${input,,}" == "y" ]] && PROFILE_FLOPS=true
     fi
 
     # Visualization
-    read -p "Generate timeline plot? (y/n) [n]: " input
+    read -p "Generate timeline plot per run? (y/n) [n]: " input
     [[ "${input,,}" == "y" ]] && PLOT_TIMELINE=true
 
     echo ""
@@ -270,6 +300,7 @@ parse_args() {
             --results-dir) RESULTS_DIR="$2"; shift 2 ;;
             --result-filename) RESULT_FILENAME="$2"; shift 2 ;;
             --append-result) APPEND_RESULT=true; shift ;;
+            --sweep-csv) SWEEP_CSV="$2"; shift 2 ;;
             --profile) PROFILE=true; shift ;;
             --profile-dir) PROFILE_DIR="$2"; shift 2 ;;
             --profile-shapes) PROFILE_SHAPES=true; shift ;;
@@ -292,7 +323,7 @@ parse_args() {
 # =============================================================================
 validate_args() {
     local missing=()
-    
+
     [[ -z "$MODEL" ]] && missing+=("--model")
     [[ -z "$INPUT_TOKENS" ]] && missing+=("--input-tokens")
     [[ -z "$OUTPUT_TOKENS" ]] && missing+=("--output-tokens")
@@ -306,10 +337,14 @@ validate_args() {
         echo "Use --help for usage or -i for interactive mode"
         exit 1
     fi
+
+    [[ -z "$SWEEP_CSV" ]] && SWEEP_CSV="${RESULTS_DIR}/sweep_results.csv"
 }
 
 # =============================================================================
 # Build Benchmark Command
+# Uses the CURRENT (per-iteration) scalar values of INPUT_TOKENS, OUTPUT_TOKENS
+# and CONCURRENCY - these are set by run_sweep() before each individual run.
 # =============================================================================
 build_bench_cmd() {
     local cmd="vllm bench serve"
@@ -361,121 +396,40 @@ build_bench_cmd() {
 }
 
 # =============================================================================
-# Run Benchmark
+# Extract Metrics from raw benchmark output.
+# Populates the ME_* globals used by both the per-run JSON and the sweep CSV.
 # =============================================================================
-run_benchmark() {
-    mkdir -p "$RESULTS_DIR"
-    $PROFILE && mkdir -p "$PROFILE_DIR"
+extract_metrics() {
+    local output="$1"
 
-    # Generate result filename
-    local timestamp
-    timestamp=$(date +"%Y%m%d_%H%M%S")
-    local model_short
-    model_short=$(basename "$MODEL" | tr '/' '_')
+    ME_MEAN_TTFT=$(echo "$output" | grep -E "^Mean TTFT \(ms\):" | awk '{print $4}' || echo "")
+    ME_MEDIAN_TTFT=$(echo "$output" | grep -E "^Median TTFT \(ms\):" | awk '{print $4}' || echo "")
+    ME_P90_TTFT=$(echo "$output" | grep -E "^P90 TTFT \(ms\):" | awk '{print $4}' || echo "")
 
-    if [[ -n "$RESULT_FILENAME" ]]; then
-        RESULT_FILE="${RESULTS_DIR}/${RESULT_FILENAME}.json"
-    else
-        RESULT_FILE="${RESULTS_DIR}/benchmark_${model_short}_${timestamp}.json"
+    ME_MEAN_TPOT=$(echo "$output" | grep -E "^Mean TPOT \(ms\):" | awk '{print $4}' || echo "")
+    ME_MEDIAN_TPOT=$(echo "$output" | grep -E "^Median TPOT \(ms\):" | awk '{print $4}' || echo "")
+    ME_P90_TPOT=$(echo "$output" | grep -E "^P90 TPOT \(ms\):" | awk '{print $4}' || echo "")
+
+    ME_MEAN_ITL=$(echo "$output" | grep -E "^Mean ITL \(ms\):" | awk '{print $4}' || echo "")
+    ME_MEDIAN_ITL=$(echo "$output" | grep -E "^Median ITL \(ms\):" | awk '{print $4}' || echo "")
+    ME_P90_ITL=$(echo "$output" | grep -E "^P90 ITL \(ms\):" | awk '{print $4}' || echo "")
+
+    ME_REQ_THROUGHPUT=$(echo "$output" | grep -E "^Request throughput \(req/s\):" | awk '{print $4}' || echo "")
+    ME_OUTPUT_THROUGHPUT=$(echo "$output" | grep -E "^Output token throughput \(tok/s\):" | awk '{print $5}' || echo "")
+
+    ME_INTERACTIVITY=""
+    if [[ -n "$ME_OUTPUT_THROUGHPUT" && "$CONCURRENCY" -gt 0 ]]; then
+        ME_INTERACTIVITY=$(echo "scale=2; $ME_OUTPUT_THROUGHPUT / $CONCURRENCY" | bc 2>/dev/null || echo "")
     fi
-
-    local LOG_FILE="${RESULTS_DIR}/benchmark_${model_short}_${timestamp}.log"
-
-    # Print configuration
-    echo ""
-    echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}        Benchmark Configuration${NC}"
-    echo -e "${CYAN}========================================${NC}"
-    echo "  Server:       $BASE_URL"
-    echo "  Model:        $MODEL"
-    echo "  Input:        $INPUT_TOKENS tokens"
-    echo "  Output:       $OUTPUT_TOKENS tokens"
-    echo "  Concurrency:  $CONCURRENCY"
-    echo "  Prompts:      $NUM_PROMPTS"
-    echo "  Request Rate: $REQUEST_RATE"
-    echo "  Dataset:      $DATASET"
-    echo "  Results:      $RESULT_FILE"
-    $PROFILE && echo "  Profile Dir:  $PROFILE_DIR"
-    echo -e "${CYAN}========================================${NC}"
-    echo ""
-
-    # Build command
-    local cmd
-    cmd=$(build_bench_cmd)
-
-    log_info "Running benchmark..."
-    echo "Command: $cmd"
-    echo ""
-
-    # Execute benchmark
-    local output
-    local exit_code=0
-    output=$(eval "$cmd" 2>&1) || exit_code=$?
-
-    # Log output
-    echo "$output" > "$LOG_FILE"
-
-    # Check success
-    if ! echo "$output" | grep -q "Serving Benchmark Result"; then
-        log_error "Benchmark failed"
-        echo "$output" | tail -20
-        exit 1
-    fi
-
-    log_success "Benchmark completed"
-    echo ""
-
-    # Extract and save results as JSON
-    save_results_json "$output"
-
-    # Display key metrics
-    echo ""
-    echo -e "${CYAN}Key Metrics:${NC}"
-    echo "$output" | grep -E "(Mean TTFT|Mean TPOT|Mean ITL|Request throughput|Output token throughput)" | head -10
-    echo ""
-
-    # Generate timeline plot if requested
-    if $PLOT_TIMELINE; then
-        generate_timeline_plot
-    fi
-
-    echo ""
-    log_success "Results saved to: $RESULT_FILE"
-    echo "Log saved to: $LOG_FILE"
 }
 
 # =============================================================================
-# Save Results as JSON
+# Save Results as JSON (single run)
 # =============================================================================
 save_results_json() {
     local output="$1"
-    
-    # Extract metrics
-    local mean_ttft median_ttft p90_ttft
-    local mean_tpot median_tpot p90_tpot
-    local mean_itl median_itl p90_itl
-    local req_throughput output_throughput
 
-    mean_ttft=$(echo "$output" | grep -E "^Mean TTFT \(ms\):" | awk '{print $4}' || echo "null")
-    median_ttft=$(echo "$output" | grep -E "^Median TTFT \(ms\):" | awk '{print $4}' || echo "null")
-    p90_ttft=$(echo "$output" | grep -E "^P90 TTFT \(ms\):" | awk '{print $4}' || echo "null")
-
-    mean_tpot=$(echo "$output" | grep -E "^Mean TPOT \(ms\):" | awk '{print $4}' || echo "null")
-    median_tpot=$(echo "$output" | grep -E "^Median TPOT \(ms\):" | awk '{print $4}' || echo "null")
-    p90_tpot=$(echo "$output" | grep -E "^P90 TPOT \(ms\):" | awk '{print $4}' || echo "null")
-
-    mean_itl=$(echo "$output" | grep -E "^Mean ITL \(ms\):" | awk '{print $4}' || echo "null")
-    median_itl=$(echo "$output" | grep -E "^Median ITL \(ms\):" | awk '{print $4}' || echo "null")
-    p90_itl=$(echo "$output" | grep -E "^P90 ITL \(ms\):" | awk '{print $4}' || echo "null")
-
-    req_throughput=$(echo "$output" | grep -E "^Request throughput \(req/s\):" | awk '{print $4}' || echo "null")
-    output_throughput=$(echo "$output" | grep -E "^Output token throughput \(tok/s\):" | awk '{print $5}' || echo "null")
-
-    # Calculate interactivity
-    local interactivity="null"
-    if [[ "$output_throughput" != "null" && "$CONCURRENCY" -gt 0 ]]; then
-        interactivity=$(echo "scale=2; $output_throughput / $CONCURRENCY" | bc 2>/dev/null || echo "null")
-    fi
+    extract_metrics "$output"
 
     # Build JSON
     local json_result
@@ -494,24 +448,24 @@ save_results_json() {
   },
   "metrics": {
     "ttft_ms": {
-      "mean": ${mean_ttft:-null},
-      "median": ${median_ttft:-null},
-      "p90": ${p90_ttft:-null}
+      "mean": ${ME_MEAN_TTFT:-null},
+      "median": ${ME_MEDIAN_TTFT:-null},
+      "p90": ${ME_P90_TTFT:-null}
     },
     "tpot_ms": {
-      "mean": ${mean_tpot:-null},
-      "median": ${median_tpot:-null},
-      "p90": ${p90_tpot:-null}
+      "mean": ${ME_MEAN_TPOT:-null},
+      "median": ${ME_MEDIAN_TPOT:-null},
+      "p90": ${ME_P90_TPOT:-null}
     },
     "itl_ms": {
-      "mean": ${mean_itl:-null},
-      "median": ${median_itl:-null},
-      "p90": ${p90_itl:-null}
+      "mean": ${ME_MEAN_ITL:-null},
+      "median": ${ME_MEDIAN_ITL:-null},
+      "p90": ${ME_P90_ITL:-null}
     },
     "throughput": {
-      "requests_per_sec": ${req_throughput:-null},
-      "output_tokens_per_sec": ${output_throughput:-null},
-      "tokens_per_sec_per_user": ${interactivity:-null}
+      "requests_per_sec": ${ME_REQ_THROUGHPUT:-null},
+      "output_tokens_per_sec": ${ME_OUTPUT_THROUGHPUT:-null},
+      "tokens_per_sec_per_user": ${ME_INTERACTIVITY:-null}
     }
   },
   "profiling": {
@@ -524,15 +478,12 @@ EOF
 
     # Handle append mode
     if $APPEND_RESULT && [[ -f "$RESULT_FILE" ]]; then
-        # Read existing JSON array and append
         local existing
         existing=$(cat "$RESULT_FILE")
         if echo "$existing" | grep -q '^\['; then
-            # Remove trailing ] and append new result
             existing="${existing%]}"
             echo "${existing},${json_result}]" > "$RESULT_FILE"
         else
-            # Convert single object to array
             echo "[${existing},${json_result}]" > "$RESULT_FILE"
         fi
     else
@@ -541,70 +492,270 @@ EOF
 }
 
 # =============================================================================
-# Generate Timeline Plot
+# Append one row to the sweep summary CSV.
+# Writes the header first if the file doesn't exist yet.
+# Called after EVERY run (success or failure) so progress is never lost.
+# =============================================================================
+init_sweep_csv() {
+    if [[ ! -f "$SWEEP_CSV" ]]; then
+        mkdir -p "$(dirname "$SWEEP_CSV")"
+        echo "timestamp,status,model,dataset,input_tokens,output_tokens,concurrency,num_prompts,request_rate,mean_ttft_ms,median_ttft_ms,p90_ttft_ms,mean_tpot_ms,median_tpot_ms,p90_tpot_ms,mean_itl_ms,median_itl_ms,p90_itl_ms,req_throughput_per_s,output_tok_throughput_per_s,tok_per_s_per_user,result_file,log_file" > "$SWEEP_CSV"
+    fi
+}
+
+append_sweep_row() {
+    local status="$1"
+
+    local row
+    row="$(date -Iseconds),${status},${MODEL},${DATASET},${INPUT_TOKENS},${OUTPUT_TOKENS},${CONCURRENCY},${NUM_PROMPTS},${REQUEST_RATE},${ME_MEAN_TTFT:-},${ME_MEDIAN_TTFT:-},${ME_P90_TTFT:-},${ME_MEAN_TPOT:-},${ME_MEDIAN_TPOT:-},${ME_P90_TPOT:-},${ME_MEAN_ITL:-},${ME_MEDIAN_ITL:-},${ME_P90_ITL:-},${ME_REQ_THROUGHPUT:-},${ME_OUTPUT_THROUGHPUT:-},${ME_INTERACTIVITY:-},${RESULT_FILE:-},${LOG_FILE:-}"
+
+    echo "$row" >> "$SWEEP_CSV"
+}
+
+# =============================================================================
+# Generate Timeline Plot (single run)
 # =============================================================================
 generate_timeline_plot() {
     log_info "Generating timeline plot..."
 
-    # Check if matplotlib is available
     if ! python3 -c "import matplotlib" 2>/dev/null; then
         log_warn "matplotlib not installed. Skipping plot generation."
         echo "  Install with: pip install matplotlib"
         return
     fi
 
-    local plot_file="${RESULTS_DIR}/timeline_$(date +%Y%m%d_%H%M%S).png"
+    local plot_file="${RESULTS_DIR}/timeline_$(date +%Y%m%d_%H%M%S)_in${INPUT_TOKENS}_out${OUTPUT_TOKENS}_c${CONCURRENCY}.png"
 
-    python3 << EOF
+    RESULT_FILE="$RESULT_FILE" PLOT_FILE="$plot_file" python3 << 'EOF'
 import json
+import os
 import matplotlib.pyplot as plt
 
+result_file = os.environ["RESULT_FILE"]
+plot_file = os.environ["PLOT_FILE"]
+
 try:
-    with open("$RESULT_FILE", 'r') as f:
+    with open(result_file, 'r') as f:
         data = json.load(f)
-    
-    # Handle both single result and array
+
     if isinstance(data, list):
-        data = data[-1]  # Use latest result
-    
+        data = data[-1]
+
     metrics = data['metrics']
     config = data['config']
-    
-    # Create figure
+
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f"Benchmark Results: {config['model']}", fontsize=14)
-    
-    # TTFT
+    fig.suptitle(
+        f"Benchmark: {config['model']} | in={config['input_tokens']} "
+        f"out={config['output_tokens']} conc={config['concurrency']}",
+        fontsize=13,
+    )
+
     ttft = metrics['ttft_ms']
     axes[0].bar(['Mean', 'Median', 'P90'], [ttft['mean'] or 0, ttft['median'] or 0, ttft['p90'] or 0], color='steelblue')
     axes[0].set_title('Time To First Token (ms)')
     axes[0].set_ylabel('ms')
-    
-    # TPOT
+
     tpot = metrics['tpot_ms']
     axes[1].bar(['Mean', 'Median', 'P90'], [tpot['mean'] or 0, tpot['median'] or 0, tpot['p90'] or 0], color='coral')
     axes[1].set_title('Time Per Output Token (ms)')
     axes[1].set_ylabel('ms')
-    
-    # Throughput
+
     tp = metrics['throughput']
-    axes[2].bar(['Req/s', 'Tok/s', 'Tok/s/user'], 
-                [tp['requests_per_sec'] or 0, 
-                 (tp['output_tokens_per_sec'] or 0) / 100,  # Scale for visibility
-                 tp['tokens_per_sec_per_user'] or 0], 
+    axes[2].bar(['Req/s', 'Tok/s', 'Tok/s/user'],
+                [tp['requests_per_sec'] or 0,
+                 (tp['output_tokens_per_sec'] or 0) / 100,
+                 tp['tokens_per_sec_per_user'] or 0],
                 color='seagreen')
     axes[2].set_title('Throughput')
     axes[2].set_ylabel('Value (tok/s scaled by 100)')
-    
+
     plt.tight_layout()
-    plt.savefig("$plot_file", dpi=150)
-    print(f"Plot saved to: $plot_file")
+    plt.savefig(plot_file, dpi=150)
+    print(f"Plot saved to: {plot_file}")
 except Exception as e:
     print(f"Error generating plot: {e}")
 EOF
 
     if [[ -f "$plot_file" ]]; then
         log_success "Timeline plot saved to: $plot_file"
+    fi
+}
+
+# =============================================================================
+# Run ONE benchmark for the CURRENT scalar INPUT_TOKENS / OUTPUT_TOKENS /
+# CONCURRENCY values. Never exits the process on failure - returns non-zero
+# so the sweep can continue to the next combination.
+# =============================================================================
+run_single_benchmark() {
+    mkdir -p "$RESULTS_DIR"
+    $PROFILE && mkdir -p "${PROFILE_DIR}/in${INPUT_TOKENS}_out${OUTPUT_TOKENS}_c${CONCURRENCY}"
+
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    local model_short
+    model_short=$(basename "$MODEL" | tr '/' '_')
+
+    local combo_tag="in${INPUT_TOKENS}_out${OUTPUT_TOKENS}_c${CONCURRENCY}"
+    local prefix="${RESULT_FILENAME:-benchmark_${model_short}}"
+
+    RESULT_FILE="${RESULTS_DIR}/${prefix}_${combo_tag}_${timestamp}.json"
+    LOG_FILE="${RESULTS_DIR}/${prefix}_${combo_tag}_${timestamp}.log"
+
+    if $PROFILE; then
+        # keep per-combo profiling isolated
+        RUN_PROFILE_DIR="${PROFILE_DIR}/${combo_tag}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}        Benchmark Configuration${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo "  Server:       $BASE_URL"
+    echo "  Model:        $MODEL"
+    echo "  Input:        $INPUT_TOKENS tokens"
+    echo "  Output:       $OUTPUT_TOKENS tokens"
+    echo "  Concurrency:  $CONCURRENCY"
+    echo "  Prompts:      $NUM_PROMPTS"
+    echo "  Request Rate: $REQUEST_RATE"
+    echo "  Dataset:      $DATASET"
+    echo "  Results:      $RESULT_FILE"
+    $PROFILE && echo "  Profile Dir:  $RUN_PROFILE_DIR"
+    echo -e "${CYAN}========================================${NC}"
+    echo ""
+
+    local cmd
+    if $PROFILE; then
+        local saved_profile_dir="$PROFILE_DIR"
+        PROFILE_DIR="$RUN_PROFILE_DIR"
+        cmd=$(build_bench_cmd)
+        PROFILE_DIR="$saved_profile_dir"
+    else
+        cmd=$(build_bench_cmd)
+    fi
+
+    log_info "Running benchmark..."
+    echo "Command: $cmd"
+    echo ""
+
+    local output
+    local exit_code=0
+    output=$(eval "$cmd" 2>&1) || exit_code=$?
+
+    echo "$output" > "$LOG_FILE"
+
+    if ! echo "$output" | grep -q "Serving Benchmark Result"; then
+        log_error "Benchmark failed for input=${INPUT_TOKENS} output=${OUTPUT_TOKENS} concurrency=${CONCURRENCY}"
+        echo "$output" | tail -20
+        # clear metrics so the CSV row records blanks, and log a failure row
+        ME_MEAN_TTFT="" ME_MEDIAN_TTFT="" ME_P90_TTFT=""
+        ME_MEAN_TPOT="" ME_MEDIAN_TPOT="" ME_P90_TPOT=""
+        ME_MEAN_ITL="" ME_MEDIAN_ITL="" ME_P90_ITL=""
+        ME_REQ_THROUGHPUT="" ME_OUTPUT_THROUGHPUT="" ME_INTERACTIVITY=""
+        append_sweep_row "FAILED"
+        return 1
+    fi
+
+    log_success "Benchmark completed"
+    echo ""
+
+    save_results_json "$output"
+
+    echo ""
+    echo -e "${CYAN}Key Metrics:${NC}"
+    echo "$output" | grep -E "(Mean TTFT|Mean TPOT|Mean ITL|Request throughput|Output token throughput)" | head -10
+    echo ""
+
+    if $PLOT_TIMELINE; then
+        generate_timeline_plot
+    fi
+
+    append_sweep_row "SUCCESS"
+
+    echo ""
+    log_success "Results saved to: $RESULT_FILE"
+    echo "Log saved to: $LOG_FILE"
+    echo "Sweep summary appended to: $SWEEP_CSV"
+
+    return 0
+}
+
+# =============================================================================
+# Run the full sweep: cartesian product of INPUT_TOKENS x OUTPUT_TOKENS x
+# CONCURRENCY (each of which may be a single value or a comma-separated list).
+# =============================================================================
+run_sweep() {
+    local input_list_str="$INPUT_TOKENS"
+    local output_list_str="$OUTPUT_TOKENS"
+    local conc_list_str="$CONCURRENCY"
+
+    local -a input_arr output_arr conc_arr
+    IFS=',' read -ra input_arr <<< "$input_list_str"
+    IFS=',' read -ra output_arr <<< "$output_list_str"
+    IFS=',' read -ra conc_arr <<< "$conc_list_str"
+
+    # trim whitespace on each element
+    local i
+    for i in "${!input_arr[@]}"; do input_arr[$i]=$(echo "${input_arr[$i]}" | xargs); done
+    for i in "${!output_arr[@]}"; do output_arr[$i]=$(echo "${output_arr[$i]}" | xargs); done
+    for i in "${!conc_arr[@]}"; do conc_arr[$i]=$(echo "${conc_arr[$i]}" | xargs); done
+
+    local total=$(( ${#input_arr[@]} * ${#output_arr[@]} * ${#conc_arr[@]} ))
+
+    init_sweep_csv
+
+    if [[ $total -gt 1 ]]; then
+        echo ""
+        echo -e "${CYAN}========================================${NC}"
+        echo -e "${CYAN}   Sweep Mode: ${total} combinations${NC}"
+        echo -e "${CYAN}   input-tokens:  ${input_list_str}${NC}"
+        echo -e "${CYAN}   output-tokens: ${output_list_str}${NC}"
+        echo -e "${CYAN}   concurrency:   ${conc_list_str}${NC}"
+        echo -e "${CYAN}   sweep CSV:     ${SWEEP_CSV}${NC}"
+        echo -e "${CYAN}========================================${NC}"
+    fi
+
+    local run_idx=0
+    local fail_count=0
+    local i_val o_val c_val
+
+    for i_val in "${input_arr[@]}"; do
+        for o_val in "${output_arr[@]}"; do
+            for c_val in "${conc_arr[@]}"; do
+                run_idx=$((run_idx + 1))
+                if [[ $total -gt 1 ]]; then
+                    echo ""
+                    log_info "[$run_idx/$total] input=${i_val} output=${o_val} concurrency=${c_val}"
+                fi
+
+                # set the per-iteration scalar values used everywhere else
+                INPUT_TOKENS="$i_val"
+                OUTPUT_TOKENS="$o_val"
+                CONCURRENCY="$c_val"
+
+                if ! run_single_benchmark; then
+                    fail_count=$((fail_count + 1))
+                fi
+            done
+        done
+    done
+
+    # restore list strings in case caller needs them
+    INPUT_TOKENS="$input_list_str"
+    OUTPUT_TOKENS="$output_list_str"
+    CONCURRENCY="$conc_list_str"
+
+    echo ""
+    if [[ $total -gt 1 ]]; then
+        echo -e "${CYAN}========================================${NC}"
+        log_success "Sweep complete: $((total - fail_count))/${total} runs succeeded"
+        [[ $fail_count -gt 0 ]] && log_warn "${fail_count} run(s) failed - see sweep CSV for details"
+        echo "Sweep summary CSV: $SWEEP_CSV"
+        echo -e "${CYAN}========================================${NC}"
+    fi
+
+    if [[ $fail_count -eq $total ]]; then
+        exit 1
     fi
 }
 
@@ -633,11 +784,11 @@ main() {
     # Check server
     check_server
 
-    # Run benchmark
-    run_benchmark
+    # Run benchmark(s) - handles both single-run and sweep cases
+    run_sweep
 
     echo ""
-    log_success "Benchmark complete!"
+    log_success "Benchmark run(s) complete!"
 }
 
 main "$@"
