@@ -1,0 +1,7 @@
+datasets
+numpy
+onnxruntime
+silero-vad
+soundfile
+torch
+webrtcvad
