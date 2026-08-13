@@ -406,7 +406,9 @@ validate_args() {
         [[ -z "$TOKENIZER" ]] && TOKENIZER="$MODEL"
     fi
 
-    [[ -z "$SWEEP_CSV" ]] && SWEEP_CSV="${RESULTS_DIR}/sweep_results.csv"
+    if [[ -z "$SWEEP_CSV" ]]; then
+        SWEEP_CSV="${RESULTS_DIR}/sweep_results.csv"
+    fi
 }
 
 # =============================================================================
