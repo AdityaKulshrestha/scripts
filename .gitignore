@@ -1,3 +1,6 @@
 .venv
 results
 __pycache__
+build
+results
+xpu
