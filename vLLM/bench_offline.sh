@@ -21,6 +21,8 @@ INPUT_TOKENS="128,1024"
 OUTPUT_TOKENS="1,32"
 BATCH_SIZES="1,4,8,16"
 TP=1
+DP=1
+EP=1
 NUM_ITERS=10
 NUM_WARMUP=5
 MAX_MODEL_LEN=8192
@@ -28,7 +30,7 @@ RESULTS_DIR="./results"
 RESULT_FILENAME=""
 INTERACTIVE=false
 PROFILE=false
-PROFILE_DIR="./vllm_profile"
+PROFILE_DIR=""
 
 # =============================================================================
 # Logging
@@ -72,14 +74,18 @@ OPTIONAL OPTIONS:
     --output-tokens <list>      Comma-separated output token lengths (default: 1,32)
     --batch-sizes <list>        Comma-separated batch sizes (default: 1,4,8,16)
     --tp <num>                  Tensor parallelism (default: 1)
+    --dp <num>                  Data parallelism (default: 1)
+    --ep <num>                  Expert parallelism (default: 1)
+                               Must satisfy EP_SIZE = TP_SIZE x DP_SIZE
     --num-iters <num>           Number of benchmark iterations (default: 10)
     --num-warmup <num>          Number of warmup iterations (default: 5)
     --max-model-len <num>       Max model context length (default: 8192)
     --results-dir <path>        Results directory (default: ./results)
     --result-filename <name>    Custom result filename (without extension)
     -i, --interactive           Interactive mode
-    -p, --profile               Enable PyTorch profiling
-    --profile-dir <path>        Profile output directory (default: ./vllm_profile)
+    -p, --profile               Enable PyTorch profiling and record tensor shapes
+    --profile-dir <path>        Profile output directory. If relative, it is stored under results-dir
+                               (default: results-dir/vllm_profile)
     -h, --help                  Show this help
 
 EXAMPLES:
@@ -89,8 +95,12 @@ EXAMPLES:
     # Interactive mode
     ./bench_offline.sh -i
 
-    # With profiling
+    # With profiling (default profile dir: ./results/vllm_profile)
     ./bench_offline.sh --model meta-llama/Llama-2-7b -p
+
+    # Custom profile dir stored under the results folder
+    ./bench_offline.sh --model meta-llama/Llama-2-7b -p --results-dir ./my_runs --profile-dir my_profile
+    # -> profile output goes to ./my_runs/my_profile
 
     # Custom sweep
     ./bench_offline.sh --model google/gemma-3-4b-it \
@@ -173,6 +183,14 @@ run_interactive() {
     read -p "Tensor parallelism [1]: " input
     TP="${input:-1}"
 
+    # Data parallelism
+    read -p "Data parallelism [1]: " input
+    DP="${input:-1}"
+
+    # Expert parallelism
+    read -p "Expert parallelism (must equal TP x DP) [1]: " input
+    EP="${input:-1}"
+
     # Iterations
     read -p "Number of iterations [10]: " input
     NUM_ITERS="${input:-10}"
@@ -193,8 +211,8 @@ run_interactive() {
     read -p "Enable profiling? (y/n) [n]: " input
     if [[ "${input,,}" == "y" ]]; then
         PROFILE=true
-        read -p "Profile directory [./vllm_profile]: " input
-        PROFILE_DIR="${input:-./vllm_profile}"
+        read -p "Profile directory [results/vllm_profile]: " input
+        PROFILE_DIR="${input:-}"
     fi
 
     echo ""
@@ -214,6 +232,8 @@ parse_args() {
             --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
             --batch-sizes) BATCH_SIZES="$2"; shift 2 ;;
             --tp) TP="$2"; shift 2 ;;
+            --dp) DP="$2"; shift 2 ;;
+            --ep) EP="$2"; shift 2 ;;
             --num-iters) NUM_ITERS="$2"; shift 2 ;;
             --num-warmup) NUM_WARMUP="$2"; shift 2 ;;
             --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
@@ -235,6 +255,12 @@ validate_args() {
         echo "Use --help for usage or -i for interactive mode"
         exit 1
     fi
+
+    local expected_ep=$((TP * DP))
+    if [[ "$EP" -ne "$expected_ep" ]]; then
+        log_error "Invalid parallelism configuration: EP ($EP) must equal TP ($TP) x DP ($DP) = $expected_ep"
+        exit 1
+    fi
 }
 
 # =============================================================================
@@ -254,6 +280,12 @@ run_single_benchmark() {
     cmd+=" --num-iters-warmup $NUM_WARMUP"
     cmd+=" --max-model-len $MAX_MODEL_LEN"
     cmd+=" -tp $TP"
+    if [[ "$DP" -gt 1 ]]; then
+        cmd+=" -dp $DP"
+    fi
+    if [[ "$EP" -gt 1 ]]; then
+        cmd+=" --enable-expert-parallel"
+    fi
     cmd+=" --no-enable-prefix-caching"
     cmd+=" --trust-remote-code"
 
@@ -261,7 +293,7 @@ run_single_benchmark() {
     if $PROFILE; then
         local profile_subdir="${PROFILE_DIR}/in${input_len}_out${output_len}_bs${batch_size}"
         mkdir -p "$profile_subdir"
-        cmd+=" --profile --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$profile_subdir\"}'"
+        cmd+=" --profile --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$profile_subdir\", \"torch_profiler_with_flops\": true, \"torch_profiler_record_shapes\": true}'"
     fi
 
     echo "$cmd"
@@ -312,7 +344,15 @@ calculate_itl() {
 # =============================================================================
 run_benchmark() {
     mkdir -p "$RESULTS_DIR"
-    $PROFILE && mkdir -p "$PROFILE_DIR"
+
+    if $PROFILE; then
+        if [[ -z "$PROFILE_DIR" ]]; then
+            PROFILE_DIR="${RESULTS_DIR}/vllm_profile"
+        elif [[ "$PROFILE_DIR" != /* ]]; then
+            PROFILE_DIR="${RESULTS_DIR}/${PROFILE_DIR}"
+        fi
+        mkdir -p "$PROFILE_DIR"
+    fi
 
     # Generate result filename
     local timestamp
@@ -343,6 +383,8 @@ run_benchmark() {
     echo "  Output Tokens:  ${OUTPUT_ARR[*]}"
     echo "  Batch Sizes:    ${BATCH_ARR[*]}"
     echo "  TP:             $TP"
+    echo "  DP:             $DP"
+    echo "  EP:             $EP"
     echo "  Iterations:     $NUM_ITERS (warmup: $NUM_WARMUP)"
     echo "  Max Model Len:  $MAX_MODEL_LEN"
     echo "  Results:        $CSV_FILE"
@@ -443,11 +485,11 @@ run_benchmark() {
     echo -e "${CYAN}========================================${NC}"
 
     # Main CSV header (raw data)
-    echo "timestamp,model,input_len,output_len,batch_size,tp,avg_latency_s,p10_s,p25_s,p50_s,p75_s,p90_s,p99_s" > "$CSV_FILE"
+    echo "timestamp,model,input_len,output_len,batch_size,tp,dp,ep,avg_latency_s,p10_s,p25_s,p50_s,p75_s,p90_s,p99_s" > "$CSV_FILE"
 
     # ITL CSV with cross-reference columns
     ITL_FILE="${CSV_FILE%.csv}_itl.csv"
-    echo "timestamp,model,input_len,batch_size,tp,output_low,output_high,avg_latency_out_${out_low}_s,avg_latency_out_${out_high}_s,itl_ms" > "$ITL_FILE"
+    echo "timestamp,model,input_len,batch_size,tp,dp,ep,output_low,output_high,avg_latency_out_${out_low}_s,avg_latency_out_${out_high}_s,itl_ms" > "$ITL_FILE"
 
     local run_timestamp
     run_timestamp=$(date -Iseconds)
@@ -471,7 +513,7 @@ run_benchmark() {
                 local p99="${P99_MAP[$key]:-N/A}"
 
                 # Write to main CSV
-                echo "$run_timestamp,$MODEL,$input_len,$output_len,$batch_size,$TP,$avg_lat,$p10,$p25,$p50,$p75,$p90,$p99" >> "$CSV_FILE"
+                echo "$run_timestamp,$MODEL,$input_len,$output_len,$batch_size,$TP,$DP,$EP,$avg_lat,$p10,$p25,$p50,$p75,$p90,$p99" >> "$CSV_FILE"
 
                 # Display
                 if [[ "$avg_lat" != "ERROR" && "$avg_lat" != "N/A" ]]; then
@@ -506,7 +548,7 @@ run_benchmark() {
                 fi
 
                 # Write to ITL CSV with all cross-reference columns
-                echo "$run_timestamp,$MODEL,$input_len,$batch_size,$TP,$out_low,$out_high,$lat_low,$lat_high,$itl" >> "$ITL_FILE"
+                echo "$run_timestamp,$MODEL,$input_len,$batch_size,$TP,$DP,$EP,$out_low,$out_high,$lat_low,$lat_high,$itl" >> "$ITL_FILE"
 
                 # Display
                 if [[ "$lat_low" != "ERROR" && "$lat_high" != "ERROR" ]]; then
