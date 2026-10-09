@@ -76,7 +76,7 @@ OPTIONAL OPTIONS:
     --tp <num>                  Tensor parallelism (default: 1)
     --dp <num>                  Data parallelism (default: 1)
     --ep <num>                  Expert parallelism (default: 1)
-                               Must satisfy EP_SIZE = TP_SIZE x DP_SIZE
+                               When EP > 1, must equal TP x DP
     --num-iters <num>           Number of benchmark iterations (default: 10)
     --num-warmup <num>          Number of warmup iterations (default: 5)
     --max-model-len <num>       Max model context length (default: 8192)
@@ -188,7 +188,7 @@ run_interactive() {
     DP="${input:-1}"
 
     # Expert parallelism
-    read -p "Expert parallelism (must equal TP x DP) [1]: " input
+    read -p "Expert parallelism (if > 1, must equal TP x DP) [1]: " input
     EP="${input:-1}"
 
     # Iterations
@@ -256,10 +256,12 @@ validate_args() {
         exit 1
     fi
 
-    local expected_ep=$((TP * DP))
-    if [[ "$EP" -ne "$expected_ep" ]]; then
-        log_error "Invalid parallelism configuration: EP ($EP) must equal TP ($TP) x DP ($DP) = $expected_ep"
-        exit 1
+    if [[ "$EP" -gt 1 ]]; then
+        local expected_ep=$((TP * DP))
+        if [[ "$EP" -ne "$expected_ep" ]]; then
+            log_error "Invalid parallelism configuration: EP ($EP) must equal TP ($TP) x DP ($DP) = $expected_ep"
+            exit 1
+        fi
     fi
 }
 
